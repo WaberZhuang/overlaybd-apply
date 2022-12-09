@@ -37,13 +37,13 @@ ext2_filsys do_ext2fs_open(io_manager extfs_manager) {
         &fs                   // ret_fs
     );
     if (ret) {
-        errno = -translate_error(nullptr, 0, ret);
+        errno = -parse_extfs_error(nullptr, 0, ret);
         LOG_ERROR("failed ext2fs_open, errno `:`", errno, strerror(errno));
         return nullptr;
     }
     ret = ext2fs_read_bitmaps(fs);
     if (ret) {
-        errno = -translate_error(fs, 0, ret);
+        errno = -parse_extfs_error(fs, 0, ret);
         LOG_ERROR("failed ext2fs_read_bitmaps, errno `:`", errno, strerror(errno));
         ext2fs_close(fs);
         return nullptr;
@@ -76,15 +76,15 @@ ext2_file_t do_ext2fs_open_file(ext2_filsys fs, const char *path, unsigned int f
         return nullptr;
     }
     ext2_file_t file;
-    ret = ext2fs_file_open(fs, ino, translate_open_flags(flags), &file);
+    ret = ext2fs_file_open(fs, ino, extfs_open_flags(flags), &file);
     if (ret) {
-        errno = -translate_error(fs, ino, ret);
+        errno = -parse_extfs_error(fs, ino, ret);
         return nullptr;
     }
     if (flags & O_TRUNC) {
         ret = ext2fs_file_set_size2(file, 0);
         if (ret) {
-            errno = -translate_error(fs, ino, ret);
+            errno = -parse_extfs_error(fs, ino, ret);
             return nullptr;
         }
     }
@@ -105,12 +105,12 @@ long do_ext2fs_read(
     }
     if (offset != -1) {
         ret = ext2fs_file_llseek(file, offset, EXT2_SEEK_SET, NULL);
-        if (ret) return translate_error(nullptr, 0, ret);
+        if (ret) return parse_extfs_error(nullptr, 0, ret);
     }
     unsigned int got;
     LOG_DEBUG("read ", VALUE(offset), VALUE(count));
     ret = ext2fs_file_read(file, buffer, count, &got);
-    if (ret) return translate_error(nullptr, 0, ret);
+    if (ret) return parse_extfs_error(nullptr, 0, ret);
     total_read_cnt += got;
     if ((flags & O_NOATIME) == 0) {
         ret = update_xtime(file, EXT_ATIME);
@@ -138,11 +138,11 @@ long do_ext2fs_write(
         ret = ext2fs_file_llseek(file, offset, EXT2_SEEK_SET, NULL);
     }
 
-    if (ret) return translate_error(nullptr, 0, ret);
+    if (ret) return parse_extfs_error(nullptr, 0, ret);
     unsigned int written;
     LOG_DEBUG("write ", VALUE(offset), VALUE(count));
     ret = ext2fs_file_write(file, buffer, count, &written);
-    if (ret) return translate_error(nullptr, 0, ret);
+    if (ret) return parse_extfs_error(nullptr, 0, ret);
     total_write_cnt += written;
     // update_mtime
     ret = update_xtime(file, EXT_CTIME | EXT_MTIME);
@@ -150,7 +150,7 @@ long do_ext2fs_write(
 
     ret = ext2fs_file_flush(file);
     if (ret) {
-        return translate_error(nullptr, 0, ret);
+        return parse_extfs_error(nullptr, 0, ret);
     }
 
     return written;
@@ -161,7 +161,7 @@ int do_ext2fs_chmod(ext2_filsys fs, ext2_ino_t ino, int mode) {
     memset(&inode, 0, sizeof(inode));
 
     errcode_t ret = ext2fs_read_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     // keep only fmt (file or directory)
     inode.i_mode &= LINUX_S_IFMT;
@@ -170,7 +170,7 @@ int do_ext2fs_chmod(ext2_filsys fs, ext2_ino_t ino, int mode) {
     increment_version(&inode);
 
     ret = ext2fs_write_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
@@ -189,7 +189,7 @@ int do_ext2fs_chown(ext2_filsys fs, ext2_ino_t ino, int uid, int gid) {
 
     // TODO handle 32 bit {u,g}ids
     errcode_t ret = ext2fs_read_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
     // keep only the lower 16 bits
     inode.i_uid = uid & 0xFFFF;
     ext2fs_set_i_uid_high(inode, uid >> 16);
@@ -198,7 +198,7 @@ int do_ext2fs_chown(ext2_filsys fs, ext2_ino_t ino, int uid, int gid) {
     increment_version(&inode);
 
     ret = ext2fs_write_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
@@ -216,7 +216,7 @@ int do_ext2fs_utimes(ext2_filsys fs, ext2_ino_t ino, const struct timeval tv[2])
     memset(&inode, 0, sizeof(inode));
 
     errcode_t ret = ext2fs_read_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     inode.i_atime = tv[0].tv_sec;
     inode.i_mtime = tv[1].tv_sec;
@@ -224,7 +224,7 @@ int do_ext2fs_utimes(ext2_filsys fs, ext2_ino_t ino, const struct timeval tv[2])
     increment_version(&inode);
 
     ret = ext2fs_write_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
@@ -244,12 +244,10 @@ int do_ext2fs_unlink(ext2_filsys fs, const char *path) {
     DEFER(LOG_DEBUG("unlink ", VALUE(path), VALUE(ino), VALUE(ret)));
     ino = string_to_inode(fs, path, 0, true);
     if (ino == 0) {
-        ret = ENOENT;
         return -ENOENT;
     }
 
     if (ext2fs_check_directory(fs, ino) == 0) {
-        ret = EISDIR;
         return -EISDIR;
     }
 
@@ -285,23 +283,23 @@ int do_ext2fs_mkdir(ext2_filsys fs, const char *path, int mode) {
     }
 
     ret = ext2fs_new_inode(fs, parent, LINUX_S_IFDIR, 0, &ino);
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
     ret = ext2fs_mkdir(fs, parent, ino, filename);
     if (ret == EXT2_ET_DIR_NO_SPACE) {
         ret = ext2fs_expand_dir(fs, parent);
-        if (ret) return translate_error(fs, 0, ret);
+        if (ret) return parse_extfs_error(fs, 0, ret);
         LOG_WARN("ext2fs_expand_mkdir ", VALUE(parent));
         ret = ext2fs_mkdir(fs, parent, ino, filename);
     }
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
 
     struct ext2_inode_large inode;
     memset(&inode, 0, sizeof(inode));
     ret = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
     inode.i_mode = (mode & ~LINUX_S_IFMT) | LINUX_S_IFDIR;
     ret = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
 
     return 0;
 }
@@ -322,7 +320,7 @@ int do_ext2fs_rmdir(ext2_filsys fs, const char *path) {
     rds.empty = 1;
 
     ret = ext2fs_dir_iterate2(fs, ino, 0, 0, rmdir_proc, &rds);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     if (rds.empty == 0) {
         ret = ENOTEMPTY;
@@ -341,7 +339,7 @@ int do_ext2fs_rmdir(ext2_filsys fs, const char *path) {
         struct ext2_inode_large inode;
         memset(&inode, 0, sizeof(inode));
         ret = ext2fs_read_inode_full(fs, rds.parent, (struct ext2_inode *)&inode, sizeof(inode));
-        if (ret) return translate_error(fs, rds.parent, ret);
+        if (ret) return parse_extfs_error(fs, rds.parent, ret);
 
         if (inode.i_links_count > 1)
             inode.i_links_count--;
@@ -349,7 +347,7 @@ int do_ext2fs_rmdir(ext2_filsys fs, const char *path) {
         ret = update_xtime(fs, rds.parent, (struct ext2_inode *)&inode, EXT_CTIME | EXT_MTIME);
         if (ret) return ret;
         ret = ext2fs_write_inode_full(fs, rds.parent, (struct ext2_inode *)&inode, sizeof(inode));
-        if (ret) return translate_error(fs, rds.parent, ret);
+        if (ret) return parse_extfs_error(fs, rds.parent, ret);
     }
 
     return 0;
@@ -400,7 +398,7 @@ int do_ext2fs_rename(ext2_filsys fs, const char *from, const char *to) {
     /* If the target exists, unlink it first */
     if (to_ino != 0) {
         ret = ext2fs_read_inode(fs, to_ino, &inode);
-        if (ret) return translate_error(fs, to_ino, ret);
+        if (ret) return parse_extfs_error(fs, to_ino, ret);
 
         LOG_DEBUG("unlinking ` ino=`", LINUX_S_ISDIR(inode.i_mode) ? "dir" : "file", to_ino);
         if (LINUX_S_ISDIR(inode.i_mode))
@@ -412,43 +410,43 @@ int do_ext2fs_rename(ext2_filsys fs, const char *from, const char *to) {
 
     /* Get ready to do the move */
     ret = ext2fs_read_inode(fs, from_ino, &inode);
-    if (ret) return translate_error(fs, from_ino, ret);
+    if (ret) return parse_extfs_error(fs, from_ino, ret);
 
     /* Link in the new file */
     LOG_DEBUG("linking ino=`/path=` to dir=`", from_ino, filename, to_dir_ino);
     ret = ext2fs_link(fs, to_dir_ino, filename, from_ino, ext2_file_type(inode.i_mode));
     if (ret == EXT2_ET_DIR_NO_SPACE) {
         ret = ext2fs_expand_dir(fs, to_dir_ino);
-        if (ret) return translate_error(fs, to_dir_ino, ret);
+        if (ret) return parse_extfs_error(fs, to_dir_ino, ret);
 
         ret = ext2fs_link(fs, to_dir_ino, filename, from_ino, ext2_file_type(inode.i_mode));
     }
-    if (ret) return translate_error(fs, to_dir_ino, ret);
+    if (ret) return parse_extfs_error(fs, to_dir_ino, ret);
 
     /* Update '..' pointer if dir */
     ret = ext2fs_read_inode(fs, from_ino, &inode);
-    if (ret) return translate_error(fs, from_ino, ret);
+    if (ret) return parse_extfs_error(fs, from_ino, ret);
 
     if (LINUX_S_ISDIR(inode.i_mode)) {
         ud.new_dotdot = to_dir_ino;
         LOG_DEBUG("updating .. entry for dir=`", to_dir_ino);
         ret = ext2fs_dir_iterate2(fs, from_ino, 0, NULL, update_dotdot_helper, &ud);
-        if (ret) return translate_error(fs, from_ino, ret);
+        if (ret) return parse_extfs_error(fs, from_ino, ret);
 
         /* Decrease from_dir_ino's links_count */
         LOG_DEBUG("moving linkcount from dir=` to dir=`", from_dir_ino, to_dir_ino);
         ret = ext2fs_read_inode(fs, from_dir_ino, &inode);
-        if (ret) return translate_error(fs, from_dir_ino, ret);
+        if (ret) return parse_extfs_error(fs, from_dir_ino, ret);
         inode.i_links_count--;
         ret = ext2fs_write_inode(fs, from_dir_ino, &inode);
-        if (ret) return translate_error(fs, from_dir_ino, ret);
+        if (ret) return parse_extfs_error(fs, from_dir_ino, ret);
 
         /* Increase to_dir_ino's links_count */
         ret = ext2fs_read_inode(fs, to_dir_ino, &inode);
-        if (ret) return translate_error(fs, to_dir_ino, ret);
+        if (ret) return parse_extfs_error(fs, to_dir_ino, ret);
         inode.i_links_count++;
         ret = ext2fs_write_inode(fs, to_dir_ino, &inode);
-        if (ret) return translate_error(fs, to_dir_ino, ret);
+        if (ret) return parse_extfs_error(fs, to_dir_ino, ret);
     }
 
     /* Update timestamps */
@@ -465,7 +463,7 @@ int do_ext2fs_rename(ext2_filsys fs, const char *from, const char *to) {
 
     /* Flush the whole mess out */
     ret = ext2fs_flush2(fs, 0);
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
 
     return 0;
 }
@@ -500,7 +498,7 @@ int do_ext2fs_link(ext2_filsys fs, const char *src, const char *dest) {
     struct ext2_inode_large inode;
     memset(&inode, 0, sizeof(inode));
     ret = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     inode.i_links_count++;
     // update_ctime
@@ -508,16 +506,16 @@ int do_ext2fs_link(ext2_filsys fs, const char *src, const char *dest) {
     if (ret) return ret;
 
     ret = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     ret = ext2fs_link(fs, parent, filename, ino, ext2_file_type(inode.i_mode));
     if (ret == EXT2_ET_DIR_NO_SPACE) {
         ret = ext2fs_expand_dir(fs, parent);
-        if (ret) return translate_error(fs, parent, ret);
+        if (ret) return parse_extfs_error(fs, parent, ret);
 
         ret = ext2fs_link(fs, parent, filename, ino, ext2_file_type(inode.i_mode));
     }
-    if (ret) return translate_error(fs, parent, ret);
+    if (ret) return parse_extfs_error(fs, parent, ret);
 
     // update_mtime
     ret = update_xtime(fs, parent, nullptr, EXT_CTIME | EXT_MTIME);
@@ -552,11 +550,11 @@ int do_ext2fs_symlink(ext2_filsys fs, const char *src, const char *dest) {
     ret = ext2fs_symlink(fs, parent, 0, filename, src);
     if (ret == EXT2_ET_DIR_NO_SPACE) {
         ret = ext2fs_expand_dir(fs, parent);
-        if (ret) return translate_error(fs, parent, ret);
+        if (ret) return parse_extfs_error(fs, parent, ret);
 
         ret = ext2fs_symlink(fs, parent, 0, filename, src);
     }
-    if (ret) return translate_error(fs, parent, ret);
+    if (ret) return parse_extfs_error(fs, parent, ret);
 
     /* Update parent dir's mtime */
     ret = update_xtime(fs, parent, nullptr, EXT_CTIME | EXT_MTIME);
@@ -572,10 +570,10 @@ int do_ext2fs_symlink(ext2_filsys fs, const char *src, const char *dest) {
     struct ext2_inode_large inode;
     memset(&inode, 0, sizeof(inode));
     ret = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     ret = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
@@ -625,16 +623,16 @@ int do_ext2fs_mknod(ext2_filsys fs, const char *path, unsigned int st_mode, unsi
     }
 
     ret = ext2fs_new_inode(fs, parent, 010755, 0, &ino);
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
 
     ret = ext2fs_link(fs, parent, filename, ino, filetype);
     if (ret == EXT2_ET_DIR_NO_SPACE) {
         ret = ext2fs_expand_dir(fs, parent);
-        if (ret) return translate_error(fs, parent, ret);
+        if (ret) return parse_extfs_error(fs, parent, ret);
 
         ret = ext2fs_link(fs, parent, filename, ino, filetype);
     }
-    if (ret) return translate_error(fs, parent, ret);
+    if (ret) return parse_extfs_error(fs, parent, ret);
 
     if (ext2fs_test_inode_bitmap2(fs->inode_map, ino))
         LOG_WARN("Warning: inode already set");
@@ -662,7 +660,7 @@ int do_ext2fs_mknod(ext2_filsys fs, const char *path, unsigned int st_mode, unsi
     inode.i_links_count = 1;
 
     ret = ext2fs_write_new_inode(fs, ino, &inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
@@ -675,7 +673,7 @@ int do_ext2fs_stat(ext2_filsys fs, ext2_ino_t ino, struct stat *statbuf) {
     struct ext2_inode_large inode;
     memset(&inode, 0, sizeof(inode));
     ret = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     memcpy(&fakedev, fs->super->s_uuid, sizeof(fakedev));
     statbuf->st_dev = fakedev;
@@ -720,9 +718,9 @@ int do_ext2fs_readdir(ext2_filsys fs, const char *path, std::vector<::dirent> *d
         ino,  // inode,
         0,    // flags TODO
         &file);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
     ret = ext2fs_check_directory(fs, ino);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
     auto block_buf = (char *)malloc(fs->blocksize);
     ret = ext2fs_dir_iterate(
         fs,
@@ -732,7 +730,7 @@ int do_ext2fs_readdir(ext2_filsys fs, const char *path, std::vector<::dirent> *d
         copy_dirent_to_result,
         (void *)dirs);
     free(block_buf);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
@@ -968,7 +966,7 @@ public:
             }
             if (ret) {
                 LOG_DEBUG("ext2fs_namei not found ", VALUE(str), VALUE(follow));
-                errno = -translate_error(fs, 0, ret);
+                errno = -parse_extfs_error(fs, 0, ret);
                 delete i;
                 return nullptr;
             }
@@ -1004,7 +1002,7 @@ photon::fs::IFileSystem *new_extfs(photon::fs::IFile *file, bool buffer) {
     return extfs->fs ? extfs : nullptr;
 }
 
-static ext2_ino_t string_to_inode(ext2_filsys fs, const char *str, int follow, bool release) {
+ext2_ino_t string_to_inode(ext2_filsys fs, const char *str, int follow, bool release) {
     auto reserved = reinterpret_cast<std::uintptr_t *>(fs->reserved);
     auto extfs = reinterpret_cast<ExtFileSystem *>(reserved[0]);
     LOG_DEBUG("string_to_inode ", VALUE(str), VALUE(follow), VALUE(release));

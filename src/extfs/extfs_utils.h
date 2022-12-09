@@ -3,30 +3,41 @@
 #include <dirent.h>
 #include <photon/common/alog.h>
 
-static int __translate_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino,
-                             const char *file, int line);
-#define translate_error(fs, ino, err) __translate_error((fs), (err), (ino), \
-                                                        __FILE__, __LINE__)
+int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::string &err_msg);
 
-static void get_now(struct timespec *now) {
+// parse_extfs_error parse extfs error to unix error code
+// print ERROR log for unclassified extfs error
+#define parse_extfs_error(fs, ino, err) ({                                                      \
+    std::string __msg;                                                                          \
+    int __err = __parse_extfs_error((fs), (err), (ino), __msg);                                 \
+    if (__msg != "") {                                                                          \
+        if (ino) {                                                                              \
+            LOG_ERROR("unclassified ext2fs error: `:` (inode #`)", __err, __msg.c_str(), ino);  \
+        } else {                                                                                \
+            LOG_ERROR("unclassified ext2fs error: `:`", __err, __msg.c_str());                  \
+        }                                                                                       \
+    }                                                                                           \
+    __err;                                                                                      \
+})
+
+inline void increment_version(struct ext2_inode *inode) {
+    inode->osd1.linux1.l_i_version++;
+}
+
+inline void get_now(struct timespec *now) {
 #ifdef CLOCK_REALTIME
     if (!clock_gettime(CLOCK_REALTIME, now))
         return;
 #endif
-
     now->tv_sec = time(NULL);
     now->tv_nsec = 0;
-}
-
-static void increment_version(struct ext2_inode *inode) {
-    inode->osd1.linux1.l_i_version++;
 }
 
 #define EXT_ATIME 1
 #define EXT_CTIME 2
 #define EXT_MTIME 4
 
-static int update_xtime(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *pinode,
+int update_xtime(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *pinode,
                         int flags, struct timespec *file_time = nullptr) {
     errcode_t ret = 0;
     struct ext2_inode inode, *pino;
@@ -37,7 +48,7 @@ static int update_xtime(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *pinod
         memset(&inode, 0, sizeof(inode));
         ret = ext2fs_read_inode(fs, ino, &inode);
         if (ret)
-            return translate_error(fs, ino, ret);
+            return parse_extfs_error(fs, ino, ret);
         pino = &inode;
     }
 
@@ -56,69 +67,53 @@ static int update_xtime(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *pinod
     if (!pinode) {
         ret = ext2fs_write_inode(fs, ino, &inode);
         if (ret)
-            return translate_error(fs, ino, ret);
+            return parse_extfs_error(fs, ino, ret);
     }
 
     return 0;
 }
 
-static int update_xtime(ext2_file_t file, int flags, struct timespec *file_time = nullptr) {
+int update_xtime(ext2_file_t file, int flags, struct timespec *file_time = nullptr) {
     errcode_t ret = 0;
     ext2_filsys fs = ext2fs_file_get_fs(file);
     ext2_ino_t ino = ext2fs_file_get_inode_num(file);
     struct ext2_inode *inode = ext2fs_file_get_inode(file);
 
     ret = ext2fs_read_inode(fs, ino, inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     ret = update_xtime(fs, ino, inode, flags, file_time);
     if (ret) return ret;
 
     ret = ext2fs_write_inode(fs, ino, inode);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     return 0;
 }
 
-static int ext2_file_type(unsigned int mode) {
-    if (LINUX_S_ISREG(mode))
-        return EXT2_FT_REG_FILE;
-
-    if (LINUX_S_ISDIR(mode))
-        return EXT2_FT_DIR;
-
-    if (LINUX_S_ISCHR(mode))
-        return EXT2_FT_CHRDEV;
-
-    if (LINUX_S_ISBLK(mode))
-        return EXT2_FT_BLKDEV;
-
-    if (LINUX_S_ISLNK(mode))
-        return EXT2_FT_SYMLINK;
-
-    if (LINUX_S_ISFIFO(mode))
-        return EXT2_FT_FIFO;
-
-    if (LINUX_S_ISSOCK(mode))
-        return EXT2_FT_SOCK;
-
-    return 0;
+int ext2_file_type(unsigned int mode) {
+    switch (mode & LINUX_S_IFMT) {
+        case LINUX_S_IFLNK:  return EXT2_FT_SYMLINK;
+        case LINUX_S_IFREG:  return EXT2_FT_REG_FILE;
+        case LINUX_S_IFDIR:  return EXT2_FT_DIR;
+        case LINUX_S_IFCHR:  return EXT2_FT_CHRDEV;
+        case LINUX_S_IFBLK:  return EXT2_FT_BLKDEV;
+        case LINUX_S_IFIFO:  return EXT2_FT_FIFO;
+        case LINUX_S_IFSOCK: return EXT2_FT_SOCK;
+        default:             return EXT2_FT_UNKNOWN;
+    }
 }
 
-static unsigned int translate_open_flags(unsigned int flags) {
-    unsigned int result = 0;
-    if (flags & (O_WRONLY | O_RDWR)) {
-        result |= EXT2_FILE_WRITE;
-    }
-    if (flags & O_CREAT) {
-        result |= EXT2_FILE_CREATE;
-    }
-    return result;
+unsigned int extfs_open_flags(unsigned int flags) {
+    unsigned int ret = 0;
+    if (flags & (O_WRONLY | O_RDWR)) ret |= EXT2_FILE_WRITE;
+    if (flags & O_CREAT) ret |= EXT2_FILE_CREATE;
+    return ret;
 }
 
-static ext2_ino_t string_to_inode(ext2_filsys fs, const char *str, int follow, bool release = false);
+ext2_ino_t string_to_inode(ext2_filsys fs, const char *str, int follow, bool release = false);
 
-static int unlink_file_by_name(ext2_filsys fs, const char *path) {
+int unlink_file_by_name(ext2_filsys fs, const char *path) {
     errcode_t ret = 0;
     ext2_ino_t ino;
 
@@ -132,7 +127,6 @@ static int unlink_file_by_name(ext2_filsys fs, const char *path) {
         *base_name++ = '\0';
         ino = string_to_inode(fs, filename, 0);
         if (ino == 0) {
-            ret = ENOENT;
             return -ENOENT;
         }
     } else {
@@ -141,11 +135,11 @@ static int unlink_file_by_name(ext2_filsys fs, const char *path) {
     }
 
     ret = ext2fs_unlink(fs, ino, base_name, 0, 0);
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
     return update_xtime(fs, ino, nullptr, EXT_CTIME | EXT_MTIME);
 }
 
-static int remove_inode(ext2_filsys fs, ext2_ino_t ino) {
+int remove_inode(ext2_filsys fs, ext2_ino_t ino) {
     errcode_t ret = 0;
 
     DEFER(LOG_DEBUG("remove ", VALUE(ino), VALUE(ret)));
@@ -153,35 +147,27 @@ static int remove_inode(ext2_filsys fs, ext2_ino_t ino) {
     struct ext2_inode_large inode;
     memset(&inode, 0, sizeof(inode));
     ret = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
-    switch (inode.i_links_count) {
-        case 0:
-            return 0; /* XXX: already done? */
-        case 1:
-            inode.i_links_count--;
-            inode.i_dtime = time(0);
-            break;
-        default:
-            inode.i_links_count--;
-    }
+    if (inode.i_links_count == 0) return 0;
+    inode.i_links_count--;
+    if (inode.i_links_count == 0) inode.i_dtime = time(0);
 
     ret = update_xtime(fs, ino, (struct ext2_inode *)&inode, EXT_CTIME);
     if (ret) return ret;
 
-    if (inode.i_links_count)
-        goto write_out;
+    if (inode.i_links_count) {
+        return parse_extfs_error(fs, ino, ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode)));
+    }
 
     /* Nobody holds this file; free its blocks! */
     ret = ext2fs_free_ext_attr(fs, ino, &inode);
-    if (ret)
-        goto write_out;
+    if (ret) return parse_extfs_error(fs, ino, ret);
 
     if (ext2fs_inode_has_valid_blocks2(fs, (struct ext2_inode *)&inode)) {
         ret = ext2fs_punch(fs, ino, (struct ext2_inode *)&inode, NULL, 0, ~0ULL);
         if (ret) {
-            ret = translate_error(fs, ino, ret);
-            goto write_out;
+            return parse_extfs_error(fs, ino, ret);
         }
     }
 
@@ -189,9 +175,7 @@ static int remove_inode(ext2_filsys fs, ext2_ino_t ino) {
 
 write_out:
     ret = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return translate_error(fs, ino, ret);
-
-    return 0;
+    return parse_extfs_error(fs, ino, ret);
 }
 
 struct rd_struct {
@@ -199,7 +183,7 @@ struct rd_struct {
     int empty;
 };
 
-static int rmdir_proc(
+int rmdir_proc(
     ext2_ino_t dir,
     int entry,
     struct ext2_dir_entry *dirent,
@@ -207,6 +191,7 @@ static int rmdir_proc(
     int blocksize,
     char *buf,
     void *priv_data) {
+
     struct rd_struct *rds = (struct rd_struct *)priv_data;
 
     if (dirent->inode == 0)
@@ -222,117 +207,89 @@ static int rmdir_proc(
     return 0;
 }
 
-static int __translate_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino,
-                             const char *file, int line) {
-    int ret = err;
-    int is_err = 0;
+int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::string &err_msg) {
+    if (err < EXT2_ET_BASE) return -err;
 
-    // int disk_id = get_disk_id(fs->io);
-
-    /* Translate ext2 error to unix error code */
-    if (err < EXT2_ET_BASE) {
-        ret = -ret;
-        goto no_translation;
-    }
     switch (err) {
-        case EXT2_ET_NO_MEMORY:
-        case EXT2_ET_TDB_ERR_OOM:
-            ret = -ENOMEM;
-            break;
-        case EXT2_ET_INVALID_ARGUMENT:
-        case EXT2_ET_LLSEEK_FAILED:
-            ret = -EINVAL;
-            break;
+        case EXT2_ET_NO_MEMORY: case EXT2_ET_TDB_ERR_OOM:
+            return -ENOMEM;
+
+        case EXT2_ET_INVALID_ARGUMENT: case EXT2_ET_LLSEEK_FAILED:
+            return -EINVAL;
+
         case EXT2_ET_NO_DIRECTORY:
-            ret = -ENOTDIR;
-            break;
+            return -ENOTDIR;
+
         case EXT2_ET_FILE_NOT_FOUND:
-            ret = -ENOENT;
-            break;
-        case EXT2_ET_DIR_NO_SPACE:
-            is_err = 1;
-            /* fallthrough */
-        case EXT2_ET_TOOSMALL:
-        case EXT2_ET_BLOCK_ALLOC_FAIL:
-        case EXT2_ET_INODE_ALLOC_FAIL:
-        case EXT2_ET_EA_NO_SPACE:
-            ret = -ENOSPC;
-            break;
+            return -ENOENT;
+
+        case EXT2_ET_TOOSMALL: case EXT2_ET_BLOCK_ALLOC_FAIL: case EXT2_ET_INODE_ALLOC_FAIL: case EXT2_ET_EA_NO_SPACE:
+            return -ENOSPC;
+
         case EXT2_ET_SYMLINK_LOOP:
-            ret = -EMLINK;
-            break;
+            return -EMLINK;
+
         case EXT2_ET_FILE_TOO_BIG:
-            ret = -EFBIG;
-            break;
-        case EXT2_ET_TDB_ERR_EXISTS:
-        case EXT2_ET_FILE_EXISTS:
-        case EXT2_ET_DIR_EXISTS:
-            ret = -EEXIST;
-            break;
-        case EXT2_ET_MMP_FAILED:
-        case EXT2_ET_MMP_FSCK_ON:
-            ret = -EBUSY;
-            break;
+            return -EFBIG;
+
+        case EXT2_ET_TDB_ERR_EXISTS: case EXT2_ET_FILE_EXISTS: case EXT2_ET_DIR_EXISTS:
+            return -EEXIST;
+
+        case EXT2_ET_MMP_FAILED: case EXT2_ET_MMP_FSCK_ON:
+            return -EBUSY;
+
         case EXT2_ET_EA_KEY_NOT_FOUND:
 #ifdef ENODATA
-            ret = -ENODATA;
+            return -ENODATA;
 #else
-            ret = -ENOENT;
+            return -ENOENT;
 #endif
             break;
         /* Sometimes fuse returns a garbage file handle pointer to us... */
         case EXT2_ET_MAGIC_EXT2_FILE:
-            ret = -EFAULT;
-            break;
+            return -EFAULT;
+
         case EXT2_ET_UNIMPLEMENTED:
-            ret = -EOPNOTSUPP;
-            break;
+            return -EOPNOTSUPP;
+
         case EXT2_ET_FILE_RO:
-            ret = -EACCES;
-            break;
-        default:
-            is_err = 1;
-            ret = -EIO;
-            break;
+            return -EACCES;
     }
 
-no_translation:
-    if (!is_err)
-        return ret;
-
-    std::string decode = "to be decode";
-    switch (err) {
-        case EXT2_ET_BAD_MAGIC:
-            decode = "EXT2_ET_BAD_MAGIC";
-            break;
-        case EXT2_ET_DIR_NO_SPACE:
-            decode = "EXT2_ET_DIR_NO_SPACE";
-            break;
-        case EXT2_ET_DIR_CORRUPTED:
-            decode = "EXT2_ET_DIR_CORRUPTED";
-            break;
-        case EXT2_ET_UNEXPECTED_BLOCK_SIZE:
-            decode = "EXT2_ET_UNEXPECTED_BLOCK_SIZE";
-            break;
-    }
-    if (ino)
-        LOG_ERROR("ext2fs unclassified error: (inode #`) at `:`, ecode `:`", ino, file, line, err, decode.c_str());
-    else
-        LOG_ERROR("ext2fs unclassified error: at `:`, ecode `:`", file, line, err, decode.c_str());
-
+    // unclassified extfs error
     if (fs) {
         ext2fs_mark_super_dirty(fs);
         ext2fs_flush(fs);
     }
+    // decode error message
+    switch (err) {
+        case EXT2_ET_BAD_MAGIC:
+            err_msg = "EXT2_ET_BAD_MAGIC";
+            return -EIO;
 
-    return ret;
+        case EXT2_ET_DIR_NO_SPACE:
+            err_msg = "EXT2_ET_BAD_MAGIC";
+            return -err; /* fallthrough */
+
+        case EXT2_ET_DIR_CORRUPTED:
+            err_msg = "EXT2_ET_DIR_CORRUPTED";
+            return -EIO;
+
+        case EXT2_ET_UNEXPECTED_BLOCK_SIZE:
+            err_msg = "EXT2_ET_UNEXPECTED_BLOCK_SIZE";
+            return -EIO;
+
+        default:
+            err_msg = "to be decode";
+            return -err;
+    }
 }
 
 struct update_dotdot {
     ext2_ino_t new_dotdot;
 };
 
-static int update_dotdot_helper(
+int update_dotdot_helper(
     ext2_ino_t dir,
     int entry,
     struct ext2_dir_entry *dirent,
@@ -351,7 +308,7 @@ static int update_dotdot_helper(
     return 0;
 }
 
-static ext2_ino_t get_parent_dir_ino(ext2_filsys fs, const char *path) {
+ext2_ino_t get_parent_dir_ino(ext2_filsys fs, const char *path) {
     char *last_slash = strrchr((char *)path, '/');
     if (last_slash == 0) {
         return 0;
@@ -367,7 +324,7 @@ static ext2_ino_t get_parent_dir_ino(ext2_filsys fs, const char *path) {
     return parent_ino;
 }
 
-static char *get_filename(const char *path) {
+char *get_filename(const char *path) {
     char *last_slash = strrchr((char *)path, (int)'/');
     if (last_slash == nullptr) {
         return nullptr;
@@ -379,7 +336,7 @@ static char *get_filename(const char *path) {
     return filename;
 }
 
-static int create_file(ext2_filsys fs, const char *path, unsigned int mode, ext2_ino_t *ino) {
+int create_file(ext2_filsys fs, const char *path, unsigned int mode, ext2_ino_t *ino) {
     ext2_ino_t parent;
     errcode_t ret = 0;
 
@@ -391,7 +348,7 @@ static int create_file(ext2_filsys fs, const char *path, unsigned int mode, ext2
     }
     ret = ext2fs_new_inode(fs, parent, mode, 0, ino);
     if (ret) {
-        return translate_error(fs, parent, ret);
+        return parse_extfs_error(fs, parent, ret);
     }
     char *filename = get_filename(path);
     if (filename == nullptr) {
@@ -402,10 +359,10 @@ static int create_file(ext2_filsys fs, const char *path, unsigned int mode, ext2
     ret = ext2fs_link(fs, parent, filename, *ino, EXT2_FT_REG_FILE);
     if (ret == EXT2_ET_DIR_NO_SPACE) {
         ret = ext2fs_expand_dir(fs, parent);
-        if (ret) return translate_error(fs, parent, ret);
+        if (ret) return parse_extfs_error(fs, parent, ret);
         ret = ext2fs_link(fs, parent, filename, *ino, EXT2_FT_REG_FILE);
     }
-    if (ret) return translate_error(fs, parent, ret);
+    if (ret) return parse_extfs_error(fs, parent, ret);
     if (ext2fs_test_inode_bitmap2(fs->inode_map, *ino)) {
         LOG_WARN("inode already set ", VALUE(*ino));
     }
@@ -417,21 +374,21 @@ static int create_file(ext2_filsys fs, const char *path, unsigned int mode, ext2
     inode.i_atime = inode.i_ctime = inode.i_mtime = time(0);
     inode.i_links_count = 1;
     ret = ext2fs_inode_size_set(fs, &inode, 0);  // TODO: update size? also on write?
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
     if (ext2fs_has_feature_inline_data(fs->super)) {
         inode.i_flags |= EXT4_INLINE_DATA_FL;
     } else if (ext2fs_has_feature_extents(fs->super)) {
         ext2_extent_handle_t handle;
         inode.i_flags &= ~EXT4_EXTENTS_FL;
         ret = ext2fs_extent_open2(fs, *ino, &inode, &handle);
-        if (ret) return translate_error(fs, 0, ret);
+        if (ret) return parse_extfs_error(fs, 0, ret);
         ext2fs_extent_free(handle);
     }
     ret = ext2fs_write_new_inode(fs, *ino, &inode);
-    if (ret) return translate_error(fs, 0, ret);
+    if (ret) return parse_extfs_error(fs, 0, ret);
     if (inode.i_flags & EXT4_INLINE_DATA_FL) {
         ret = ext2fs_inline_data_init(fs, *ino);
-        if (ret) return translate_error(fs, 0, ret);
+        if (ret) return parse_extfs_error(fs, 0, ret);
     }
     return 0;
 }
@@ -481,7 +438,7 @@ int copy_dirent_to_result(struct ext2_dir_entry *dirent, int offset, int blocksi
     return 0;
 }
 
-static blkcnt_t blocks_from_inode(ext2_filsys fs, struct ext2_inode *inode) {
+blkcnt_t blocks_from_inode(ext2_filsys fs, struct ext2_inode *inode) {
     blk64_t	ret = inode->i_blocks;
 
 	if (ext2fs_has_feature_huge_file(fs->super)) {
