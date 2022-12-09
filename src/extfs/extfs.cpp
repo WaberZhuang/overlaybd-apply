@@ -244,10 +244,12 @@ int do_ext2fs_unlink(ext2_filsys fs, const char *path) {
     DEFER(LOG_DEBUG("unlink ", VALUE(path), VALUE(ino), VALUE(ret)));
     ino = string_to_inode(fs, path, 0, true);
     if (ino == 0) {
+        ret = ENOENT;
         return -ENOENT;
     }
 
     if (ext2fs_check_directory(fs, ino) == 0) {
+        ret = EISDIR;
         return -EISDIR;
     }
 

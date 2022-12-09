@@ -12,9 +12,9 @@ int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::stri
     int __err = __parse_extfs_error((fs), (err), (ino), __msg);                                 \
     if (__msg != "") {                                                                          \
         if (ino) {                                                                              \
-            LOG_ERROR("unclassified ext2fs error: `:` (inode #`)", __err, __msg.c_str(), ino);  \
+            LOG_ERROR("unclassified ext2fs error: `:` (inode #`)", err, __msg.c_str(), ino);    \
         } else {                                                                                \
-            LOG_ERROR("unclassified ext2fs error: `:`", __err, __msg.c_str());                  \
+            LOG_ERROR("unclassified ext2fs error: `:`", err, __msg.c_str());                    \
         }                                                                                       \
     }                                                                                           \
     __err;                                                                                      \
@@ -127,6 +127,7 @@ int unlink_file_by_name(ext2_filsys fs, const char *path) {
         *base_name++ = '\0';
         ino = string_to_inode(fs, filename, 0);
         if (ino == 0) {
+            ret = ENOENT;
             return -ENOENT;
         }
     } else {
@@ -140,42 +141,46 @@ int unlink_file_by_name(ext2_filsys fs, const char *path) {
 }
 
 int remove_inode(ext2_filsys fs, ext2_ino_t ino) {
-    errcode_t ret = 0;
+    errcode_t ret_err = 0;
+    errcode_t err = 0;
 
-    DEFER(LOG_DEBUG("remove ", VALUE(ino), VALUE(ret)));
+    DEFER(LOG_DEBUG("remove ", VALUE(ino), VALUE(ret_err)));
 
     struct ext2_inode_large inode;
     memset(&inode, 0, sizeof(inode));
-    ret = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    if (ret) return parse_extfs_error(fs, ino, ret);
+    ret_err = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
+    if (ret_err) return parse_extfs_error(fs, ino, ret_err);
 
     if (inode.i_links_count == 0) return 0;
     inode.i_links_count--;
     if (inode.i_links_count == 0) inode.i_dtime = time(0);
 
-    ret = update_xtime(fs, ino, (struct ext2_inode *)&inode, EXT_CTIME);
-    if (ret) return ret;
+    ret_err = update_xtime(fs, ino, (struct ext2_inode *)&inode, EXT_CTIME);
+    if (ret_err) return ret_err;
 
-    if (inode.i_links_count) {
-        return parse_extfs_error(fs, ino, ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode)));
-    }
+    if (inode.i_links_count) goto write_out;
 
     /* Nobody holds this file; free its blocks! */
-    ret = ext2fs_free_ext_attr(fs, ino, &inode);
-    if (ret) return parse_extfs_error(fs, ino, ret);
-
+    err = ext2fs_free_ext_attr(fs, ino, &inode);
+    if (err) {
+        ret_err = parse_extfs_error(fs, ino, err);
+        LOG_ERROR("ext2fs_free_ext_attr failed, ret_err: `", ret_err);
+        goto write_out;
+    }
     if (ext2fs_inode_has_valid_blocks2(fs, (struct ext2_inode *)&inode)) {
-        ret = ext2fs_punch(fs, ino, (struct ext2_inode *)&inode, NULL, 0, ~0ULL);
-        if (ret) {
-            return parse_extfs_error(fs, ino, ret);
+        err = ext2fs_punch(fs, ino, (struct ext2_inode *)&inode, NULL, 0, ~0ULL);
+        if (err) {
+            ret_err = parse_extfs_error(fs, ino, err);
+            LOG_ERROR("ext2fs_punch failed, ret_err: `", ret_err);
+            goto write_out;
         }
     }
-
     ext2fs_inode_alloc_stats2(fs, ino, -1, LINUX_S_ISDIR(inode.i_mode));
 
 write_out:
-    ret = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
-    return parse_extfs_error(fs, ino, ret);
+    err = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode, sizeof(inode));
+    if (err) ret_err = parse_extfs_error(fs, ino, err);
+    return ret_err;
 }
 
 struct rd_struct {
@@ -223,7 +228,7 @@ int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::stri
         case EXT2_ET_FILE_NOT_FOUND:
             return -ENOENT;
 
-        case EXT2_ET_TOOSMALL: case EXT2_ET_BLOCK_ALLOC_FAIL: case EXT2_ET_INODE_ALLOC_FAIL: case EXT2_ET_EA_NO_SPACE:
+        case EXT2_ET_TOOSMALL: case EXT2_ET_BLOCK_ALLOC_FAIL: case EXT2_ET_INODE_ALLOC_FAIL: case EXT2_ET_EA_NO_SPACE: case EXT2_ET_DIR_NO_SPACE:
             return -ENOSPC;
 
         case EXT2_ET_SYMLINK_LOOP:
@@ -263,26 +268,12 @@ int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::stri
     }
     // decode error message
     switch (err) {
-        case EXT2_ET_BAD_MAGIC:
-            err_msg = "EXT2_ET_BAD_MAGIC";
-            return -EIO;
-
-        case EXT2_ET_DIR_NO_SPACE:
-            err_msg = "EXT2_ET_BAD_MAGIC";
-            return -err; /* fallthrough */
-
-        case EXT2_ET_DIR_CORRUPTED:
-            err_msg = "EXT2_ET_DIR_CORRUPTED";
-            return -EIO;
-
-        case EXT2_ET_UNEXPECTED_BLOCK_SIZE:
-            err_msg = "EXT2_ET_UNEXPECTED_BLOCK_SIZE";
-            return -EIO;
-
-        default:
-            err_msg = "to be decode";
-            return -err;
+        case EXT2_ET_BAD_MAGIC:             err_msg = "EXT2_ET_BAD_MAGIC";
+        case EXT2_ET_DIR_CORRUPTED:         err_msg = "EXT2_ET_DIR_CORRUPTED";
+        case EXT2_ET_UNEXPECTED_BLOCK_SIZE: err_msg = "EXT2_ET_UNEXPECTED_BLOCK_SIZE";
+        default:                            err_msg = "to be decode";
     }
+    return -EIO;
 }
 
 struct update_dotdot {
