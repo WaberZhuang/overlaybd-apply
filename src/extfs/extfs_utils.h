@@ -228,7 +228,7 @@ int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::stri
         case EXT2_ET_FILE_NOT_FOUND:
             return -ENOENT;
 
-        case EXT2_ET_TOOSMALL: case EXT2_ET_BLOCK_ALLOC_FAIL: case EXT2_ET_INODE_ALLOC_FAIL: case EXT2_ET_EA_NO_SPACE: case EXT2_ET_DIR_NO_SPACE:
+        case EXT2_ET_TOOSMALL: case EXT2_ET_BLOCK_ALLOC_FAIL: case EXT2_ET_INODE_ALLOC_FAIL: case EXT2_ET_EA_NO_SPACE:
             return -ENOSPC;
 
         case EXT2_ET_SYMLINK_LOOP:
@@ -268,12 +268,26 @@ int __parse_extfs_error(ext2_filsys fs, errcode_t err, ext2_ino_t ino, std::stri
     }
     // decode error message
     switch (err) {
-        case EXT2_ET_BAD_MAGIC:             err_msg = "EXT2_ET_BAD_MAGIC";
-        case EXT2_ET_DIR_CORRUPTED:         err_msg = "EXT2_ET_DIR_CORRUPTED";
-        case EXT2_ET_UNEXPECTED_BLOCK_SIZE: err_msg = "EXT2_ET_UNEXPECTED_BLOCK_SIZE";
-        default:                            err_msg = "to be decode";
+        case EXT2_ET_DIR_NO_SPACE:
+            err_msg = "EXT2_ET_DIR_NO_SPACE";
+            return -ENOSPC;
+
+        case EXT2_ET_BAD_MAGIC:
+            err_msg = "EXT2_ET_BAD_MAGIC";
+            return -EIO;
+
+        case EXT2_ET_DIR_CORRUPTED:
+            err_msg = "EXT2_ET_DIR_CORRUPTED";
+            return -EIO;
+
+        case EXT2_ET_UNEXPECTED_BLOCK_SIZE:
+            err_msg = "EXT2_ET_UNEXPECTED_BLOCK_SIZE";
+            return -EIO;
+
+        default:
+            err_msg = "to be decode";
+            return -EIO;
     }
-    return -EIO;
 }
 
 struct update_dotdot {
